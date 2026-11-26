@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: touhou-karuta-relay
+    runtime: node
+    plan: free
+    region: singapore
+    buildCommand: node -v
+    startCommand: node relay/server.mjs
+    healthCheckPath: /healthz
