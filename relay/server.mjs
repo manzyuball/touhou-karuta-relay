@@ -429,13 +429,28 @@ export function createRelayServer({
       'Content-Type': mime,
       'Cache-Control': ext === '.html' ? 'no-cache' : 'public, max-age=86400, immutable',
     };
-    const encodings = String(req.headers['accept-encoding'] ?? '');
-    const gzipAccepted = encodings.split(',').some((part) => {
+    const encodings = new Map(String(req.headers['accept-encoding'] ?? '').split(',').map((part) => {
       const [encoding, ...params] = part.trim().toLowerCase().split(';');
-      return encoding.trim() === 'gzip' && !params.some((param) => /^q\s*=\s*0(?:\.0*)?$/.test(param.trim()));
-    });
+      const quality = params.find((param) => /^q\s*=/.test(param.trim()));
+      return [encoding.trim(), quality ? Number(quality.split('=')[1]) : 1];
+    }));
+    const gzipAccepted = (encodings.get('gzip') ?? encodings.get('*') ?? 0) > 0;
+    const compressible = COMPRESSIBLE_EXTS.has(ext);
+    if (compressible) headers.Vary = 'Accept-Encoding';
+    const alternatives = [['br', '.br'], ['gzip', '.gz']]
+      .map(([encoding, suffix]) => ({ encoding, suffix, quality: encodings.get(encoding) ?? encodings.get('*') ?? 0 }))
+      .filter(({ quality }) => quality > 0)
+      .sort((a, b) => b.quality - a.quality);
+    for (const { encoding, suffix } of compressible ? alternatives : []) {
+      const sidecar = filePath + suffix;
+      const packed = await statOrMissing(sidecar);
+      if (!packed?.isFile()) continue;
+      res.writeHead(200, { ...headers, 'Content-Encoding': encoding, 'Content-Length': packed.size });
+      res.end(head ? undefined : await fs.promises.readFile(sidecar));
+      return;
+    }
 
-    if (COMPRESSIBLE_EXTS.has(ext) && gzipAccepted && stat.size <= 4 * 1024 * 1024) {
+    if (compressible && gzipAccepted && stat.size <= 4 * 1024 * 1024) {
       const cacheKey = `${filePath}:${stat.size}:${stat.mtimeMs}`;
       let cached = staticGzipCache.get(cacheKey);
       if (!cached) {
@@ -670,6 +685,12 @@ export function createRelayServer({
     const isHost = role === 'host';
     if (isHost) {
       const token = urlObj.searchParams.get('token') || '';
+      const epoch = Number(urlObj.searchParams.get('epoch') ?? '0');
+      if (!Number.isSafeInteger(epoch) || epoch < 0) {
+        socket.write('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\nInvalid generation');
+        socket.destroy();
+        return;
+      }
       if (token.length < 16) {
         socket.write('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\nMissing host token');
         socket.destroy();
@@ -678,6 +699,11 @@ export function createRelayServer({
       const existing = rooms.get(roomCode);
       if (existing && existing.hostToken !== token) {
         socket.write('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\nRoom owned by another host');
+        socket.destroy();
+        return;
+      }
+      if (existing && existing.transportEpoch > epoch) {
+        socket.write('HTTP/1.1 409 Conflict\r\nConnection: close\r\n\r\nStale generation');
         socket.destroy();
         return;
       }
@@ -704,6 +730,7 @@ export function createRelayServer({
         room = {
           roomCode,
           hostToken: token,
+          transportEpoch: epoch,
           passwordRequired: urlObj.searchParams.get('pw') === '1',
           audioToken: urlObj.searchParams.get('at') || '',
           hostSocket: null,
@@ -717,6 +744,7 @@ export function createRelayServer({
         };
         rooms.set(roomCode, room);
       } else {
+        room.transportEpoch = epoch;
         if (room.graceTimer) {
           clearTimeout(room.graceTimer);
           room.graceTimer = null;
@@ -737,6 +765,7 @@ export function createRelayServer({
 
       attachWsFrameParser(socket, {
         onText: (raw) => {
+          if (room.hostSocket !== socket) return;
           let envelope;
           try {
             envelope = JSON.parse(raw);
@@ -923,7 +952,7 @@ function isDirectCliRun() {
 
 if (isDirectCliRun()) {
   const __dirname = path.dirname(fileURLToPath(import.meta.url));
-  const defaultGuestDir = path.resolve(__dirname, '..', 'dist-web-guest');
+  const defaultGuestDir = ['dist-web-guest', 'web-guest'].map((folder) => path.resolve(__dirname, '..', folder)).find(fs.existsSync);
   const tls = process.env.TLS_KEY_PATH && process.env.TLS_CERT_PATH
     ? {
         key: fs.readFileSync(process.env.TLS_KEY_PATH, 'utf8'),
@@ -933,7 +962,7 @@ if (isDirectCliRun()) {
   const relay = createRelayServer({
     port: Number(process.env.PORT || 8787),
     host: process.env.HOST || '0.0.0.0',
-    webGuestDir: process.env.WEB_GUEST_DIR || (fs.existsSync(defaultGuestDir) ? defaultGuestDir : null),
+    webGuestDir: process.env.WEB_GUEST_DIR || defaultGuestDir || null,
     tls,
   });
   const info = await relay.start();
